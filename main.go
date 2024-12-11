@@ -417,8 +417,8 @@ func main() {
 	scraper := NewJobScraper()
 
 	// Scrape Indeed jobs
-	jobTitle := "Software Engineer"
-	location := "San Francisco"
+	jobTitle := "FrontEnd Engineer"
+	location := "India"
 	maxPages := 3 // Limit to prevent excessive scraping
 
 	fmt.Printf("Scraping %s jobs in %s\n", jobTitle, location)
