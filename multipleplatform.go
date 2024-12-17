@@ -3,12 +3,11 @@ package main
 import (
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"math/rand"
-	// "net/http"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -19,7 +18,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Platform represents a job platform with specific configurations
+// Platform defines the configuration for scraping a specific job platform
 type Platform struct {
 	Name      string
 	BaseURL   string
@@ -28,18 +27,18 @@ type Platform struct {
 	Selector  PlatformSelector
 }
 
-// PlatformSelector contains CSS selectors for job details
+// PlatformSelector defines CSS selectors for extracting job information
 type PlatformSelector struct {
 	JobContainer string
 	Title        string
 	Company      string
 	Location     string
-	Description string
+	Description  string
 	Salary       string
 	PostedDate   string
 }
 
-// Job represents a job listing with comprehensive details
+// Job represents a single job listing
 type Job struct {
 	Platform    string
 	Title       string
@@ -51,39 +50,39 @@ type Job struct {
 	URL         string
 }
 
-// JobScraper handles job scraping from multiple platforms
+// JobScraper manages the scraping process across multiple platforms
 type JobScraper struct {
 	jobs        []Job
 	jobsMutex   sync.Mutex
 	rateLimiter *rate.Limiter
 	platforms   []Platform
+	collector   *colly.Collector
 }
 
-// NewJobScraper initializes the scraper with advanced configurations
+// NewJobScraper creates a new JobScraper with configured rate limiting
 func NewJobScraper(platforms []Platform) *JobScraper {
-	// Implement exponential backoff for rate limiting
-	rateLimiter := rate.NewLimiter(rate.Every(1*time.Second), 1) // More conservative rate limiting
-
+	rateLimiter := rate.NewLimiter(rate.Every(2*time.Second), 2)
+	collector := createCollector()
 	return &JobScraper{
 		jobs:        []Job{},
 		rateLimiter: rateLimiter,
 		platforms:   platforms,
+		collector:   collector,
 	}
 }
 
-// randomUserAgent generates a more comprehensive list of user agents
+// randomUserAgent returns a random user agent to mimic browser requests
 func randomUserAgent() string {
 	userAgents := []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:89.0) Gecko/20100101 Firefox/89.0",
 	}
 	return userAgents[rand.Intn(len(userAgents))]
 }
 
-// createCollector creates a new collector with advanced anti-detection techniques
+// createCollector sets up a Colly collector with advanced configurations
 func createCollector() *colly.Collector {
 	c := colly.NewCollector(
 		colly.Async(true),
@@ -92,42 +91,39 @@ func createCollector() *colly.Collector {
 		colly.AllowURLRevisit(),
 	)
 
-	// Configure browser-like headers
+	// Set up proxy rotation (optional)
+	// c.SetProxy("http://proxy-ip:port")
+
+	c.WithTransport(&http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     30 * time.Second,
+	})
+
 	c.OnRequest(func(r *colly.Request) {
-		r.Headers.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 		r.Headers.Set("Accept-Language", "en-US,en;q=0.5")
-		r.Headers.Set("Accept-Encoding", "gzip, deflate, br")
-		r.Headers.Set("Connection", "keep-alive")
-		r.Headers.Set("Upgrade-Insecure-Requests", "1")
-		r.Headers.Set("Sec-Fetch-Dest", "document")
-		r.Headers.Set("Sec-Fetch-Mode", "navigate")
-		r.Headers.Set("Sec-Fetch-Site", "none")
-		r.Headers.Set("Sec-Fetch-User", "?1")
+		r.Headers.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 	})
 
 	return c
 }
 
-// Scrape scrapes jobs from a specific platform with improved error handling
+// Scrape performs web scraping for a specific platform
 func (js *JobScraper) Scrape(platform Platform, jobTitle, location string, filters map[string]string) {
-	// Wait for rate limiter
+	// Wait for rate limiter to avoid overwhelming the target website
 	err := js.rateLimiter.Wait(context.Background())
 	if err != nil {
 		log.Printf("Rate limit error: %v", err)
 		return
 	}
 
-	// Create a new collector for each platform
-	collector := createCollector()
-
-	// Error handling and logging
-	collector.OnError(func(r *colly.Response, err error) {
-		log.Printf("Scrape Error for %s: %v, Status Code: %d, URL: %s", 
-			platform.Name, err, r.StatusCode, r.Request.URL)
+	// Reset collector for each platform
+	js.collector.OnError(func(r *colly.Response, err error) {
+		log.Printf("Scrape Error on %s: %v", platform.Name, err)
 	})
 
-	// Job extraction
-	collector.OnHTML(platform.Selector.JobContainer, func(e *colly.HTMLElement) {
+	// Parse job listings
+	js.collector.OnHTML(platform.Selector.JobContainer, func(e *colly.HTMLElement) {
 		job := Job{
 			Platform:    platform.Name,
 			Title:       sanitizeText(e.ChildText(platform.Selector.Title)),
@@ -138,8 +134,8 @@ func (js *JobScraper) Scrape(platform Platform, jobTitle, location string, filte
 			PostedDate:  sanitizeText(e.ChildText(platform.Selector.PostedDate)),
 			URL:         e.Request.URL.String(),
 		}
-		
-		// Only add non-empty jobs
+
+		// Only add job if it has essential information
 		if job.Title != "" && job.Company != "" {
 			js.jobsMutex.Lock()
 			js.jobs = append(js.jobs, job)
@@ -147,11 +143,11 @@ func (js *JobScraper) Scrape(platform Platform, jobTitle, location string, filte
 		}
 	})
 
-	// Construct URL with all parameters
-	baseURL := fmt.Sprintf("%s%s?q=%s&l=%s", 
-		platform.BaseURL, 
-		platform.QueryPath, 
-		url.QueryEscape(jobTitle), 
+	// Construct search URL
+	baseURL := fmt.Sprintf("%s%s?q=%s&l=%s",
+		platform.BaseURL,
+		platform.QueryPath,
+		url.QueryEscape(jobTitle),
 		url.QueryEscape(location),
 	)
 
@@ -160,27 +156,22 @@ func (js *JobScraper) Scrape(platform Platform, jobTitle, location string, filte
 		baseURL += fmt.Sprintf("&%s=%s", key, url.QueryEscape(value))
 	}
 
-	// Multiple attempts to visit the URL
-	maxRetries := 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		err := collector.Visit(baseURL)
-		if err == nil {
-			break
-		}
-		log.Printf("Attempt %d failed: %v", attempt+1, err)
-		time.Sleep(time.Duration(attempt+1) * 3 * time.Second)
+	// Visit the constructed URL
+	err = js.collector.Visit(baseURL)
+	if err != nil {
+		log.Printf("Failed to visit URL for %s: %v", platform.Name, err)
 	}
 
 	// Wait for all requests to complete
-	collector.Wait()
+	js.collector.Wait()
 }
 
-// sanitizeText cleans up and trims text
+// sanitizeText removes unnecessary whitespace
 func sanitizeText(text string) string {
 	return strings.TrimSpace(text)
 }
 
-// SaveToCSV saves the scraped jobs to a CSV file
+// SaveToCSV exports job listings to a CSV file
 func (js *JobScraper) SaveToCSV(filename string) {
 	file, err := os.Create(filename)
 	if err != nil {
@@ -191,79 +182,91 @@ func (js *JobScraper) SaveToCSV(filename string) {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	headers := []string{"Platform", "Title", "Company", "Location", "Description", "Salary", "Posted Date", "URL"}
-	writer.Write(headers)
+	// Write CSV headers
+	headers := []string{"Platform", "Title", "Company", "Location", "Description", "Salary", "PostedDate", "URL"}
+	if err := writer.Write(headers); err != nil {
+		log.Fatalf("Error writing headers: %v", err)
+	}
+
+	// Write job data
+	js.jobsMutex.Lock()
+	defer js.jobsMutex.Unlock()
 
 	for _, job := range js.jobs {
-		record := []string{job.Platform, job.Title, job.Company, job.Location, job.Description, job.Salary, job.PostedDate, job.URL}
-		writer.Write(record)
-	}
-}
-
-// SaveToJSON saves the scraped jobs to a JSON file
-func (js *JobScraper) SaveToJSON(filename string) {
-	file, err := os.Create(filename)
-	if err != nil {
-		log.Fatalf("Failed to create file: %v", err)
-	}
-	defer file.Close()
-
-	jsonData, err := json.MarshalIndent(js.jobs, "", "  ")
-	if err != nil {
-		log.Fatalf("Failed to marshal data to JSON: %v", err)
+		record := []string{
+			job.Platform,
+			job.Title,
+			job.Company,
+			job.Location,
+			job.Description,
+			job.Salary,
+			job.PostedDate,
+			job.URL,
+		}
+		if err := writer.Write(record); err != nil {
+			log.Printf("Error writing job record: %v", err)
+		}
 	}
 
-	file.Write(jsonData)
+	log.Printf("Saved %d jobs to %s", len(js.jobs), filename)
 }
 
 func main() {
-	// Seed random number generator
-	rand.Seed(time.Now().UnixNano())
-
-	// Command-line inputs
-	jobTitle := flag.String("jobTitle", "Software Engineer", "Job title to search")
-	location := flag.String("location", "Remote", "Location to search jobs")
-	output := flag.String("output", "multipleplatformjobs.csv", "Output file name (CSV/JSON)")
+	// Command-line flags
+	jobTitle := flag.String("title", "software engineer", "Job title to search for")
+	location := flag.String("location", "remote", "Job location to search for")
+	outputFile := flag.String("output", "multiplatformjobs.csv", "Output file for job results")
 	flag.Parse()
 
-	// Platforms to scrape with more specific selectors
+	// Define multiple job platforms
 	platforms := []Platform{
 		{
-			Name:      "Indeed", 
-			BaseURL:   "https://www.indeed.com", 
-			QueryPath: "/jobs", 
-			Filters:   map[string]string{},
+			Name:      "Indeed",
+			BaseURL:   "https://www.indeed.com",
+			QueryPath: "/jobs",
 			Selector: PlatformSelector{
-				JobContainer: "div[class^='job_seen_beacon']",
-				Title:        "h2.jobTitle span[title]",
-				Company:      "span.companyName",
-				Location:     "div.companyLocation",
-				Description: "div.job-snippet",
-				Salary:       "div.metadata.salary-snippet-container",
-				PostedDate:   "span.date",
+				JobContainer: ".job_seen_beacon",
+				Title:        ".jobTitle",
+				Company:      ".companyName",
+				Location:     ".companyLocation",
+				Description:  ".job-snippet",
+				Salary:       ".salary-snippet",
+				PostedDate:   ".date",
 			},
 		},
 		{
-			Name:      "LinkedIn", 
-			BaseURL:   "https://www.linkedin.com", 
-			QueryPath: "/jobs/search", 
-			Filters:   map[string]string{"f_TPR": "r2592000"}, // last 30 days filter
+			Name:      "LinkedIn",
+			BaseURL:   "https://www.linkedin.com",
+			QueryPath: "/jobs/search",
 			Selector: PlatformSelector{
-				JobContainer: "div.base-card",
-				Title:        "h3.base-search-card__title",
-				Company:      "h4.base-search-card__subtitle",
-				Location:     "span.job-search-card__location",
-				Description: "div.job-snippet",
-				Salary:       "span.salary-info",
-				PostedDate:   "time.job-search-card__listdate",
+				JobContainer: ".base-card",
+				Title:        ".base-search-card__title",
+				Company:      ".base-search-card__subtitle",
+				Location:     ".job-search-card__location",
+				Description:  ".job-description",
+				Salary:       ".salary-info",
+				PostedDate:   ".listed-time",
+			},
+		},
+		{
+			Name:      "Glassdoor",
+			BaseURL:   "https://www.glassdoor.com",
+			QueryPath: "/Job/jobs.htm",
+			Selector: PlatformSelector{
+				JobContainer: ".react-job-listing",
+				Title:        ".job-title",
+				Company:      ".job-employer",
+				Location:     ".job-location",
+				Description:  ".job-description",
+				Salary:       ".salary-info",
+				PostedDate:   ".job-posted",
 			},
 		},
 	}
 
-	// Initialize scraper
+	// Create and run scraper
 	scraper := NewJobScraper(platforms)
 
-	// Scrape each platform concurrently
 	var wg sync.WaitGroup
 	for _, platform := range platforms {
 		wg.Add(1)
@@ -274,13 +277,6 @@ func main() {
 	}
 	wg.Wait()
 
-	// Save results
-	if *output == "multipleplatformjobs.json" {
-		scraper.SaveToJSON(*output)
-	} else {
-		scraper.SaveToCSV(*output)
-	}
-
-	fmt.Printf("Scraping completed. Total jobs found: %d. Results saved to %s\n", 
-		len(scraper.jobs), *output)
+	// Save results to CSV
+	scraper.SaveToCSV(*outputFile)
 }
