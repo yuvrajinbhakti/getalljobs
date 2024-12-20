@@ -1,32 +1,44 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
-	"net/smtp"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/gocolly/colly/v2"
+	"golang.org/x/time/rate"
 )
 
-// Platform represents a job platform with its search configuration
+// ConfigData holds application configuration
+type ConfigData struct {
+	WhatsappAPIKey string   `json:"whatsapp_api_key"`
+	WhatsappNumber string   `json:"whatsapp_number"`
+	RedisURL       string   `json:"redis_url"`
+	ProxyList      []string `json:"proxy_list"`
+}
+
+// Platform defines the configuration for scraping a specific job platform
 type Platform struct {
 	Name      string
 	BaseURL   string
 	QueryPath string
+	Filters   map[string]string
 	Selector  PlatformSelector
 }
 
-// PlatformSelector defines the CSS selectors for extracting job details
+// PlatformSelector defines CSS selectors for extracting job information
 type PlatformSelector struct {
 	JobContainer string
 	Title        string
@@ -35,11 +47,12 @@ type PlatformSelector struct {
 	Description  string
 	Salary       string
 	PostedDate   string
-	NextPage     string // Added for pagination support
+	Skills       string
 }
 
-// Job represents a detailed job listing
+// Job represents a comprehensive job listing
 type Job struct {
+	ID          string    // Unique identifier for deduplication
 	Platform    string
 	Title       string
 	Company     string
@@ -48,46 +61,87 @@ type Job struct {
 	Salary      string
 	PostedDate  string
 	URL         string
+	Skills      []string
+	AddedAt     time.Time
 }
 
-// NotificationConfig stores notification settings
-type NotificationConfig struct {
-	Email    EmailConfig
-	WhatsApp WhatsAppConfig
-}
-
-// EmailConfig holds email notification details
-type EmailConfig struct {
-	Enabled  bool
-	From     string
-	Password string
-	To       string
-	SMTPHost string
-	SMTPPort int
-}
-
-// WhatsAppConfig holds WhatsApp notification details
-type WhatsAppConfig struct {
-	Enabled  bool
-	Number   string
-	Provider string
-}
-
-// JobScraper represents the core job scraping functionality
+// JobScraper manages the scraping process across multiple platforms
 type JobScraper struct {
-	collector   *colly.Collector
-	rateLimiter *time.Ticker
-	jobs        []Job
-	jobsMutex   sync.Mutex
+	jobs         []Job
+	jobsMutex    sync.Mutex
+	rateLimiter  *rate.Limiter
+	platforms    []Platform
+	collector    *colly.Collector
+	redis        *redis.Client
+	config       ConfigData
+	seenJobs     map[string]bool
+	seenJobMutex sync.Mutex
 }
 
-// Helper function to create a collector
+// Common user agents for rotation
+var userAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+}
+
+// Common technical skills to look for
+var commonSkills = []string{
+	"python", "java", "javascript", "golang", "react", "aws", "docker",
+	"kubernetes", "sql", "nosql", "git", "agile", "rust", "c++",
+	"machine learning", "ai", "cloud", "devops", "nodejs", "angular",
+}
+
+// Helper Functions
+func randomUserAgent() string {
+	rand.Seed(time.Now().UnixNano())
+	return userAgents[rand.Intn(len(userAgents))]
+}
+
+func sanitizeText(text string) string {
+	text = strings.TrimSpace(text)
+	text = strings.Join(strings.Fields(text), " ")
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.ReplaceAll(text, "\t", " ")
+	return text
+}
+
+func extractSkills(text string) []string {
+	text = strings.ToLower(text)
+	var foundSkills []string
+	
+	for _, skill := range commonSkills {
+		if strings.Contains(text, strings.ToLower(skill)) {
+			foundSkills = append(foundSkills, skill)
+		}
+	}
+	
+	return foundSkills
+}
+
+// NewJobScraper creates an enhanced JobScraper instance
+func NewJobScraper(platforms []Platform, config ConfigData) *JobScraper {
+	rdb := redis.NewClient(&redis.Options{
+		Addr: config.RedisURL,
+	})
+
+	return &JobScraper{
+		jobs:        []Job{},
+		rateLimiter: rate.NewLimiter(rate.Every(2*time.Second), 2),
+		platforms:   platforms,
+		collector:   createCollector(),
+		redis:       rdb,
+		config:      config,
+		seenJobs:    make(map[string]bool),
+	}
+}
+
 func createCollector() *colly.Collector {
 	c := colly.NewCollector(
 		colly.Async(true),
 		colly.MaxDepth(3),
 		colly.UserAgent(randomUserAgent()),
-		colly.AllowURLRevisit(),
 	)
 
 	c.WithTransport(&http.Transport{
@@ -96,55 +150,118 @@ func createCollector() *colly.Collector {
 		IdleConnTimeout:     30 * time.Second,
 	})
 
-	c.OnRequest(func(r *colly.Request) {
-		r.Headers.Set("Accept-Language", "en-US,en;q=0.5")
-		r.Headers.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	})
-
 	return c
 }
 
-// Helper function to generate random user agent
-func randomUserAgent() string {
-	userAgents := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+// JobScraper Methods
+func (js *JobScraper) sendWhatsAppMessage(job Job) error {
+	message := fmt.Sprintf("🆕 New Job Alert!\n\n"+
+		"🏢 Company: %s\n"+
+		"💼 Position: %s\n"+
+		"📍 Location: %s\n"+
+		"💰 Salary: %s\n\n"+
+		"🔗 Apply here: %s",
+		job.Company, job.Title, job.Location, job.Salary, job.URL)
+
+	payload := map[string]interface{}{
+		"phone":   js.config.WhatsappNumber,
+		"message": message,
 	}
-	return userAgents[rand.Intn(len(userAgents))]
-}
 
-// Sanitize text by trimming whitespace
-func sanitizeText(text string) string {
-	return strings.TrimSpace(text)
-}
-
-// NewJobScraper creates a new job scraper instance
-func NewJobScraper() *JobScraper {
-	return &JobScraper{
-		collector:   createCollector(),
-		rateLimiter: time.NewTicker(time.Second * 2), // Rate limit requests
-		jobs:        []Job{},
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return err
 	}
+
+	req, err := http.NewRequest("POST", "https://api.whatsapp.com/v1/messages", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+js.config.WhatsappAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("whatsapp API returned status: %d", resp.StatusCode)
+	}
+
+	return nil
 }
 
-// Scrape performs job scraping for a specific platform
-func (js *JobScraper) Scrape(platform Platform, jobTitle, location string) error {
-	// Construct search URL
-	baseURL := fmt.Sprintf("%s%s?q=%s&l=%s",
-		platform.BaseURL,
-		platform.QueryPath,
-		url.QueryEscape(jobTitle),
-		url.QueryEscape(location),
-	)
+func (js *JobScraper) isNewJob(job Job) bool {
+	js.seenJobMutex.Lock()
+	defer js.seenJobMutex.Unlock()
 
-	// Setup collector error handling
-	js.collector.OnError(func(r *colly.Response, err error) {
-		log.Printf("Scrape Error on %s: %v", platform.Name, err)
-	})
+	jobID := fmt.Sprintf("%s-%s-%s", job.Platform, job.Company, job.Title)
+	if js.seenJobs[jobID] {
+		return false
+	}
 
-	// Parse job listings
+	exists, err := js.redis.Exists(context.Background(), jobID).Result()
+	if err != nil {
+		log.Printf("Redis error: %v", err)
+		return true
+	}
+
+	if exists == 1 {
+		return false
+	}
+
+	js.seenJobs[jobID] = true
+	js.redis.Set(context.Background(), jobID, time.Now().String(), 7*24*time.Hour)
+	return true
+}
+
+func (js *JobScraper) SaveToCSV(filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	header := []string{"Platform", "Title", "Company", "Location", "Salary", 
+		"Posted Date", "URL", "Skills", "Added At"}
+	if err := writer.Write(header); err != nil {
+		return err
+	}
+
+	for _, job := range js.jobs {
+		record := []string{
+			job.Platform,
+			job.Title,
+			job.Company,
+			job.Location,
+			job.Salary,
+			job.PostedDate,
+			job.URL,
+			strings.Join(job.Skills, "|"),
+			job.AddedAt.Format(time.RFC3339),
+		}
+		if err := writer.Write(record); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (js *JobScraper) Scrape(platform Platform, jobTitle, location string) {
+	err := js.rateLimiter.Wait(context.Background())
+	if err != nil {
+		log.Printf("Rate limit error: %v", err)
+		return
+	}
+
 	js.collector.OnHTML(platform.Selector.JobContainer, func(e *colly.HTMLElement) {
 		job := Job{
 			Platform:    platform.Name,
@@ -155,139 +272,63 @@ func (js *JobScraper) Scrape(platform Platform, jobTitle, location string) error
 			Salary:      sanitizeText(e.ChildText(platform.Selector.Salary)),
 			PostedDate:  sanitizeText(e.ChildText(platform.Selector.PostedDate)),
 			URL:         e.Request.URL.String(),
+			Skills:      extractSkills(e.ChildText(platform.Selector.Skills)),
+			AddedAt:     time.Now(),
 		}
 
-		js.jobsMutex.Lock()
-		js.jobs = append(js.jobs, job)
-		js.jobsMutex.Unlock()
+		if job.Title != "" && job.Company != "" && js.isNewJob(job) {
+			js.jobsMutex.Lock()
+			js.jobs = append(js.jobs, job)
+			js.jobsMutex.Unlock()
+
+			if err := js.sendWhatsAppMessage(job); err != nil {
+				log.Printf("Failed to send WhatsApp notification: %v", err)
+			}
+		}
 	})
 
-	// Visit the URL
-	return js.collector.Visit(baseURL)
-}
+	searchURL := fmt.Sprintf("%s%s?q=%s&l=%s",
+		platform.BaseURL,
+		platform.QueryPath,
+		url.QueryEscape(jobTitle),
+		url.QueryEscape(location))
 
-// SendEmailNotification sends job listings via email
-func SendEmailNotification(config EmailConfig, jobs []Job) error {
-	if len(jobs) == 0 {
-		return fmt.Errorf("no jobs to send")
+	if err := js.collector.Visit(searchURL); err != nil {
+		log.Printf("Failed to visit %s: %v", platform.Name, err)
 	}
 
-	// Compose email body
-	var emailBody strings.Builder
-	emailBody.WriteString("Daily Job Listings:\n\n")
-	for _, job := range jobs {
-		jobDetails := fmt.Sprintf(
-			"Title: %s\nCompany: %s\nLocation: %s\nURL: %s\n\n",
-			job.Title, job.Company, job.Location, job.URL,
-		)
-		emailBody.WriteString(jobDetails)
-	}
-
-	// Email authentication and sending
-	auth := smtp.PlainAuth("", config.From, config.Password, config.SMTPHost)
-
-	msg := []byte(
-		"To: " + config.To + "\r\n" +
-			"Subject: Daily Job Listings\r\n" +
-			"\r\n" +
-			emailBody.String(),
-	)
-
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort),
-		auth,
-		config.From,
-		[]string{config.To},
-		msg,
-	)
-
-	return err
+	js.collector.Wait()
 }
 
-// SendWhatsAppNotification sends job listings via WhatsApp (placeholder)
-func SendWhatsAppNotification(config WhatsAppConfig, jobs []Job) error {
-	// Implement WhatsApp notification logic
-	log.Println("WhatsApp notification not implemented")
-	return nil
-}
-
-// SaveToCSV saves job listings to a CSV file
-func SaveToCSV(filename string, jobs []Job) error {
-	file, err := os.Create(filename)
+// Configuration functions
+func loadConfig(path string) (ConfigData, error) {
+	file, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("failed to create file: %v", err)
-	}
-	defer file.Close()
-
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	// Write CSV headers
-	headers := []string{"Platform", "Title", "Company", "Location", "Description", "Salary", "PostedDate", "URL"}
-	if err := writer.Write(headers); err != nil {
-		return fmt.Errorf("error writing headers: %v", err)
+		return ConfigData{}, err
 	}
 
-	// Write job data
-	for _, job := range jobs {
-		record := []string{
-			job.Platform,
-			job.Title,
-			job.Company,
-			job.Location,
-			job.Description,
-			job.Salary,
-			job.PostedDate,
-			job.URL,
-		}
-		if err := writer.Write(record); err != nil {
-			log.Printf("Error writing job record: %v", err)
-		}
-	}
-
-	return nil
+	var config ConfigData
+	err = json.Unmarshal(file, &config)
+	return config, err
 }
 
-func main() {
-	// Command-line flags
-	jobTitle := flag.String("title", "software engineer", "Job title to search")
-	location := flag.String("location", "remote", "Job location")
-	outputFile := flag.String("output", "daily_jobs.csv", "Output CSV file")
-
-	// Email notification flags
-	emailEnabled := flag.Bool("email-enabled", false, "Enable email notifications")
-	emailFrom := flag.String("email-from", "", "Sender email")
-	emailPassword := flag.String("email-pass", "", "Email password")
-	emailTo := flag.String("email-to", "", "Recipient email")
-	smtpHost := flag.String("smtp-host", "smtp.gmail.com", "SMTP host")
-	smtpPort := flag.Int("smtp-port", 587, "SMTP port")
-
-	// WhatsApp notification flags
-	whatsappEnabled := flag.Bool("whatsapp-enabled", false, "Enable WhatsApp notifications")
-	whatsappNumber := flag.String("whatsapp-number", "", "WhatsApp number")
-	whatsappProvider := flag.String("whatsapp-provider", "", "WhatsApp provider")
-
-	flag.Parse()
-
-	// Create notification configuration
-	notificationConfig := NotificationConfig{
-		Email: EmailConfig{
-			Enabled:  *emailEnabled,
-			From:     *emailFrom,
-			Password: *emailPassword,
-			To:       *emailTo,
-			SMTPHost: *smtpHost,
-			SMTPPort: *smtpPort,
+func initializePlatforms() []Platform {
+	return []Platform{
+		{
+			Name:      "LinkedIn",
+			BaseURL:   "https://www.linkedin.com",
+			QueryPath: "/jobs/search",
+			Selector: PlatformSelector{
+				JobContainer: ".base-card",
+				Title:        ".base-search-card__title",
+				Company:      ".base-search-card__subtitle",
+				Location:     ".job-search-card__location",
+				Description:  ".job-description",
+				Salary:       ".salary-info",
+				PostedDate:   ".listed-time",
+				Skills:       ".skills-section",
+			},
 		},
-		WhatsApp: WhatsAppConfig{
-			Enabled:  *whatsappEnabled,
-			Number:   *whatsappNumber,
-			Provider: *whatsappProvider,
-		},
-	}
-
-	// Define platforms to scrape
-	platforms := []Platform{
 		{
 			Name:      "Indeed",
 			BaseURL:   "https://www.indeed.com",
@@ -300,67 +341,41 @@ func main() {
 				Description:  ".job-snippet",
 				Salary:       ".salary-snippet",
 				PostedDate:   ".date",
+				Skills:       ".skills-section",
 			},
 		},
-		// Add more platforms as needed
+	}
+}
+
+func main() {
+	jobTitle := flag.String("title", "", "Job title to search for")
+	location := flag.String("location", "", "Job location")
+	configFile := flag.String("config", "config.json", "Path to configuration file")
+	outputFile := flag.String("output", "jobs.csv", "Output CSV file")
+	flag.Parse()
+
+	configData, err := loadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Create job scraper
-	scraper := NewJobScraper()
-
-	// Scrape jobs from different platforms
-	var allJobs []Job
+	platforms := initializePlatforms()
+	scraper := NewJobScraper(platforms, configData)
+	
 	var wg sync.WaitGroup
-	var jobsMutex sync.Mutex
-
 	for _, platform := range platforms {
 		wg.Add(1)
 		go func(p Platform) {
 			defer wg.Done()
-			err := scraper.Scrape(p, *jobTitle, *location)
-			if err != nil {
-				log.Printf("Scraping error for %s: %v", p.Name, err)
-				return
-			}
-
-			jobsMutex.Lock()
-			allJobs = append(allJobs, scraper.jobs...)
-			jobsMutex.Unlock()
+			scraper.Scrape(p, *jobTitle, *location)
 		}(platform)
 	}
 	wg.Wait()
 
-	// Save to CSV
-	if err := SaveToCSV(*outputFile, allJobs); err != nil {
-		log.Printf("CSV saving error: %v", err)
-	}
-
-	// Send notifications if jobs are found
-	if len(allJobs) > 0 {
-		// Email notification
-		if notificationConfig.Email.Enabled {
-			if err := SendEmailNotification(notificationConfig.Email, allJobs); err != nil {
-				log.Printf("Email notification failed: %v", err)
-			}
-		}
-
-		// WhatsApp notification
-		if notificationConfig.WhatsApp.Enabled {
-			if err := SendWhatsAppNotification(notificationConfig.WhatsApp, allJobs); err != nil {
-				log.Printf("WhatsApp notification failed: %v", err)
-			}
-		}
+	if err := scraper.SaveToCSV(*outputFile); err != nil {
+		log.Fatalf("Failed to save results: %v", err)
 	}
 }
 
 
-/*
-go run job_scraper.go \
-  -title="software engineer" \
-  -location="remote" \
-  -email-enabled=true \
-  -email-from=your@email.com \
-  -email-pass=yourpassword \
-  -email-to=recipient@email.com \
-  -output=daily_jobs.csv
-*/
+// go run main.go -title "Software Engineer" -location "Remote" -config config.json
