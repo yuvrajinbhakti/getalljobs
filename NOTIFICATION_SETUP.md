@@ -2,6 +2,8 @@
 
 Get notified instantly when new remote fresher jobs are found!
 
+⚠️ **SECURITY NOTICE:** All examples below use placeholder values. Replace with your actual credentials when configuring.
+
 ## 🚀 Quick Start
 
 1. **Run the enhanced scraper:**
@@ -43,6 +45,8 @@ Edit `notification_config.json`:
 }
 ```
 
+**Note:** Replace with actual Gmail SMTP settings when configuring.
+
 ---
 
 ## 📱 WhatsApp Notifications Setup
@@ -82,10 +86,10 @@ Edit `notification_config.json`:
 ```json
 {
   "email": {
-    "smtp_host": "smtp.gmail.com",
-    "smtp_port": "587",
-    "from_email": "myemail@gmail.com",
-    "from_password": "abcd efgh ijkl mnop",
+    "smtp_host": "smtp.your-provider.com",
+    "smtp_port": "XXX",
+    "from_email": "your-actual-email@example.com",
+    "from_password": "your-actual-app-password",
     "to_email": "yuvrajsinghnain03@gmail.com"
   },
   "whatsapp": {

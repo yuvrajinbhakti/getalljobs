@@ -1,0 +1,19 @@
+{
+  "_README": "This is a template file with placeholder values. Copy to notification_config.json and replace with real credentials.",
+  "_SECURITY_WARNING": "Never commit real credentials to version control",
+  "email": {
+    "smtp_host": "REPLACE_WITH_YOUR_SMTP_HOST",
+    "smtp_port": "REPLACE_WITH_YOUR_SMTP_PORT",
+    "from_email": "REPLACE_WITH_YOUR_EMAIL",
+    "from_password": "REPLACE_WITH_YOUR_APP_PASSWORD",
+    "to_email": "yuvrajsinghnain03@gmail.com"
+  },
+  "whatsapp": {
+    "account_sid": "REPLACE_WITH_YOUR_TWILIO_ACCOUNT_SID",
+    "auth_token": "REPLACE_WITH_YOUR_TWILIO_AUTH_TOKEN",
+    "from_number": "REPLACE_WITH_YOUR_TWILIO_WHATSAPP_NUMBER",
+    "to_number": "whatsapp:+919216703705"
+  },
+  "enable_email": false,
+  "enable_whatsapp": false
+}
