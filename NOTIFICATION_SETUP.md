@@ -11,7 +11,11 @@ Get notified instantly when new remote fresher jobs are found!
    go run 8advanced_remote_scraper_with_notifications.go
    ```
 
-2. **Configure notifications by editing `notification_config.json`**
+2. **Configure notifications:**
+   ```bash
+   cp notification_config_template.json notification_config.json
+   # Edit notification_config.json with your actual credentials
+   ```
 
 3. **Enable your preferred notification method**
 
